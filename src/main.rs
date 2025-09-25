@@ -1,4 +1,8 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    io::{self, BufRead, BufReader},
+    str::FromStr,
+};
 
 use eyre::OptionExt;
 use regex::Regex;
@@ -36,13 +40,13 @@ fn snap_to_upper_256(size: u64) -> u64 {
 // - Structs and array data always start a new slot and their items are packed tightly according to these rules.
 // - Items following struct or array data always start a new storage slot.
 impl SolType {
-    fn size(&self, all_structs: &HashMap<String, SolStruct>) -> eyre::Result<u64> {
+    fn size(&self, all_structs: &BTreeMap<String, SolStruct>) -> eyre::Result<u64> {
         Ok(match self {
             Self::Uint(size) => (*size).into(),
             Self::Int(size) => (*size).into(),
             Self::Address => (20u32 * 8).into(),
             Self::Bool => 1,
-            Self::Bytes(size) => (size * 8).into(),
+            Self::Bytes(size) => *size as u64 * 8,
             Self::BytesArbitrary => 256,
             Self::Custom(sol_struct) => {
                 let mut size = 0;
@@ -52,7 +56,7 @@ impl SolType {
                     typ: &SolType,
                     current_word_bits_allocated: &mut u64,
                     size: &mut u64,
-                    all_structs: &HashMap<String, SolStruct>,
+                    all_structs: &BTreeMap<String, SolStruct>,
                 ) -> eyre::Result<()> {
                     let remainder_bits = 256 - *current_word_bits_allocated;
 
@@ -81,7 +85,7 @@ impl SolType {
                         SolType::FixedArray(sol_type, len) => {
                             // move to next slot
                             *current_word_bits_allocated = 0;
-                            *size += remainder_bits;
+                            *size = snap_to_upper_256(*size);
 
                             for _ in 0..*len {
                                 update_state(
@@ -156,7 +160,8 @@ impl SolType {
     }
 }
 
-const MAPPING_REGEX: &str = r"\s*mapping\s*\(\s*(?<key_type>\w+)\s*=>\s*(?<value_type>\w+)\s*\)";
+const MAPPING_REGEX: &str =
+    r"\s*mapping\s*\(\s*(?<key_type>\w+)\s*=>\s*(?<value_type>\w+(?:\[\d*\])?)\s*\)";
 const FIXED_ARRAY_REGEX: &str = r"\s*(?<type>\w+)\s*\[\s*(?<size>\d+)\s*\]\s*";
 
 impl FromStr for SolType {
@@ -215,7 +220,7 @@ impl FromStr for SolType {
                 let captures = Regex::new(FIXED_ARRAY_REGEX)
                     .map_err(|e| eyre::eyre!("fixed array regex instantiation error: {e}"))?
                     .captures(s)
-                    .ok_or_eyre("fixed array didnt match: {s}")?;
+                    .ok_or_eyre(format!("fixed array didnt match: {s}"))?;
                 let value_type = &captures["type"];
                 let size = &captures["size"];
                 let size = size
@@ -270,6 +275,11 @@ fn parse_struct(src: &str) -> eyre::Result<SolStruct> {
             continue;
         }
 
+        let line = line.trim();
+        if line.starts_with("//") {
+            continue;
+        }
+
         if line.contains("struct") {
             let st_name = line
                 .split_once("struct")
@@ -281,13 +291,14 @@ fn parse_struct(src: &str) -> eyre::Result<SolStruct> {
                 .0
                 .trim();
             struct_name = st_name;
-        } else if let splits = line.split_whitespace().collect::<Vec<_>>()
-            && splits.len() > 1
-        {
-            let field = splits.iter().last().unwrap().to_string();
-            let typ = splits[..splits.len() - 1].join(" ");
+        } else if let Some((bf, _af)) = line.split_once(";") {
+            let splits = bf.split_whitespace().collect::<Vec<_>>();
+            if splits.len() > 1 {
+                let field = splits.iter().last().unwrap().to_string();
+                let typ = splits[..splits.len() - 1].join(" ");
 
-            fields.push((field.replace(";", ""), typ.parse()?))
+                fields.push((field.replace(";", ""), typ.parse()?))
+            }
         } else if line.trim() == "}" {
             // do nothing
         } else {
@@ -303,31 +314,38 @@ fn parse_struct(src: &str) -> eyre::Result<SolStruct> {
 }
 
 fn main() -> eyre::Result<()> {
-    let chunked = chunk_structs(
-        r#"
-    struct Foo {
-        uint a;
-
-
-        uint192 b;
-        uint8 c;
-        mapping(uint => Bar) d;
+    println!("reading from stdin..");
+    let stdin = io::stdin();
+    let reader = BufReader::new(stdin.lock());
+    let mut content = String::new();
+    for line_result in reader.lines() {
+        match line_result {
+            Ok(line) => {
+                content.push_str(&line);
+                content.push('\n'); // Add newline back as `lines()` strips it
+            }
+            Err(error) => {
+                eprintln!("Error reading line: {}", error);
+                break;
+            }
+        }
     }
 
-    struct Bar {
-        uint8 a;
-        uint32 b;
-        uint224 c;
-    }
-    "#,
-    )?;
+    println!("\n--- Content read from stdin ---");
+    println!("{}", content); // Use print! instead of println! to avoid extra newline
+    println!("--- End of stdin ---");
+
+    let chunked = chunk_structs(&content)?;
+    // for (i, st) in chunked.iter().enumerate() {
+    //     println!("{i}: {st}");
+    // }
 
     let structs = chunked
         .into_iter()
         .map(|st| parse_struct(&st).map(|st| (st.name.clone(), st)))
-        .collect::<eyre::Result<HashMap<String, SolStruct>>>()?;
+        .collect::<eyre::Result<BTreeMap<String, SolStruct>>>()?;
 
-    for (name, st) in structs.iter() {
+    for (name, st) in structs.iter().rev() {
         println!("{name}:\n-------");
         for (name, typ) in &st.fields {
             println!("{name}: {:?}", typ);
@@ -335,7 +353,7 @@ fn main() -> eyre::Result<()> {
 
         let size = SolType::Custom(st.clone()).size(&structs)?;
         let bytes = snap_to_upper_256(size) / 256;
-        println!("{name}: {bytes}");
+        println!("{name}: {bytes} [{size}]");
     }
 
     Ok(())
